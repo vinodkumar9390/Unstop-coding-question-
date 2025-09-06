@@ -220,3 +220,4 @@ csv = filtered.to_csv(index=False).encode('utf-8')
 st.download_button("⬇️ Download enriched CSV", csv, file_name="enriched_support_emails.csv", mime="text/csv")
 
 st.info("This demo uses rule-based sentiment/urgency and a TF-IDF powered KB search (RAG-lite). Integrate OpenAI/HF for production-grade responses.")
+
