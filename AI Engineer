@@ -1,0 +1,222 @@
+import streamlit as st
+import pandas as pd
+import re
+from datetime import datetime
+from io import StringIO
+from typing import List, Tuple
+import heapq
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+st.set_page_config(page_title="AI Support Assistant", layout="wide")
+st.title("📬 AI-Powered Communication Assistant")
+
+
+URGENT_PATTERNS = [
+    r"\burgent\b", r"\bimmediate(ly)?\b", r"\bcritical\b", r"\bcannot access\b",
+    r"\bcan't access\b", r"\bblocked\b", r"\berror\b", r"\bfail(ure|ed)?\b",
+    r"\bdowntime\b", r"\bpayment failed\b", r"\bnot working\b", r"\basap\b", r"\bplease help\b"
+]
+POS_WORDS = set("thank appreciate great awesome good resolved happy love excellent quick helpful success".split())
+NEG_WORDS = set("cannot can't unable issue error fail failed blocked disappointed angry frustrated bad poor delay slow urgent critical".split())
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"(\+?\d{1,3}[-.\s]?)?(\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{4}")
+FILTER_TERMS = ("support", "query", "request", "help")
+
+@st.cache_data(show_spinner=False)
+def load_csv(upload) -> pd.DataFrame:
+    df = pd.read_csv(upload)
+    if 'sent_date' in df.columns:
+        df['sent_date'] = pd.to_datetime(df['sent_date'], errors='coerce')
+    for col in ['sender','subject','body']:
+        if col not in df.columns:
+            df[col] = ''
+        df[col] = df[col].astype(str)
+    return df
+
+def is_filtered(subject: str) -> bool:
+    s = (subject or '').lower()
+    return any(term in s for term in FILTER_TERMS)
+
+def is_urgent(text: str) -> bool:
+    t = (text or '').lower()
+    return any(re.search(p, t) for p in URGENT_PATTERNS)
+
+def simple_sentiment(text: str) -> str:
+    txt = re.sub(r"[^a-zA-Z\s]", " ", (text or '').lower())
+    tokens = txt.split()
+    pos = sum(t in POS_WORDS for t in tokens)
+    neg = sum(t in NEG_WORDS for t in tokens)
+    if neg > pos and neg >= 2:
+        return "Negative"
+    if pos > neg and pos >= 2:
+        return "Positive"
+    return "Neutral"
+
+def extract_contacts(text: str) -> Tuple[List[str], List[str]]:
+    emails = list({e for e in EMAIL_RE.findall(text or '')})
+    phones = list({(m[0] or '') + (m[1] or '') for m in PHONE_RE.findall(text or '')})
+    return emails, phones
+
+def extract_requirements(text: str) -> str:
+    sents = re.split(r"(?<=[.!?])\s+", (text or '').strip())
+    req_sents = [s for s in sents if re.search(r"\b(need|want|cannot|can't|request|require|ask|help)\b", s, flags=re.I)]
+    return " ".join(req_sents)
+
+
+class TinyKB:
+    def __init__(self):
+        self.docs = []
+        self.vectorizer = None
+        self.matrix = None
+
+    def fit(self, texts: List[str]):
+        self.docs = texts
+        if not texts:
+            self.vectorizer = None
+            self.matrix = None
+            return
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.matrix = self.vectorizer.fit_transform(texts)
+
+    def search(self, query: str, k: int = 3) -> List[Tuple[float, str]]:
+        if not self.vectorizer or not self.docs:
+            return []
+        qv = self.vectorizer.transform([query])
+        sims = cosine_similarity(qv, self.matrix).ravel()
+        idxs = sims.argsort()[::-1][:k]
+        return [(float(sims[i]), self.docs[i]) for i in idxs]
+
+KB = TinyKB()
+
+# Sidebar: Controls + Knowledge Base
+with st.sidebar:
+    st.header("⚙️ Controls")
+    st.markdown("Upload an optional knowledge base (plain text or Markdown).")
+    kb_file = st.file_uploader("Knowledge Base (txt/md)", type=["txt","md"], key="kb")
+    if kb_file is not None:
+        kb_text = kb_file.read().decode('utf-8', errors='ignore')
+        # Split by headers/paragraphs
+        chunks = [c.strip() for c in re.split(r"\n{2,}|^#.+$", kb_text, flags=re.M) if c.strip()]
+        KB.fit(chunks)
+        st.success(f"Loaded KB with {len(chunks)} chunks.")
+    else:
+        KB.fit([])
+
+    st.markdown("---")
+    st.caption("Filtering applies to subject contains any of: support, query, request, help")
+
+
+uploaded = st.file_uploader("Upload support emails CSV", type=["csv"], key="emails")
+
+if uploaded is None:
+    st.info("Upload the provided CSV to begin.")
+    st.stop()
+
+raw = load_csv(uploaded)
+
+
+filtered = raw[raw['subject'].str.lower().str.contains('|'.join(FILTER_TERMS))].copy()
+
+
+filtered['sentiment'] = filtered['body'].apply(simple_sentiment)
+filtered['is_urgent'] = filtered.apply(lambda r: is_urgent(r['subject']) or is_urgent(r['body']), axis=1)
+filtered['priority'] = filtered['is_urgent'].map({True: 'Urgent', False: 'Not urgent'})
+filtered[['alt_emails','phones']] = filtered['body'].apply(lambda t: pd.Series(extract_contacts(t)))
+filtered['requirements'] = filtered['body'].apply(extract_requirements)
+filtered['sent_date'] = pd.to_datetime(filtered.get('sent_date', pd.NaT), errors='coerce')
+
+# Priority queue (urgent first, then most recent)
+# heapq is min-heap -> use negative flags for desired ordering
+pq = []
+for i, row in filtered.iterrows():
+    priority = 0 if row['is_urgent'] else 1
+    ts = row['sent_date'].timestamp() if pd.notna(row['sent_date']) else 0.0
+    heapq.heappush(pq, (priority, -ts, i))
+
+
+RESP_TEMPLATE = (
+"Hello {name},\n\n"
+"Thanks for reaching out. I understand {ack}. {kb_line}"
+"Here’s what we’ll do next:\n"
+"1) {step1}\n"
+"2) {step2}\n\n"
+"If this is urgent, we’ve prioritized your ticket."
+"\n\nBest regards,\nSupport Team\n"
+)
+
+def draft_response(row: pd.Series, kb: TinyKB) -> str:
+    sender = row.get('sender', '')
+    name = sender.split('@')[0] if sender else 'there'
+    body = row.get('body', '') or ''
+    urgent = row.get('is_urgent', False)
+    sentiment = row.get('sentiment', 'Neutral')
+
+    # Empathy line
+    if urgent or sentiment == 'Negative':
+        ack = "this is blocking you and that can be frustrating"
+    else:
+        ack = "you need assistance and I’m here to help"
+
+    # RAG-lite
+    kb_hits = kb.search(body, k=1)
+    if kb_hits:
+        kb_line = "Based on our docs: " + kb_hits[0][1].strip()[:500] + "\n\n"
+    else:
+        kb_line = ""
+
+    # Steps
+    if re.search(r"\b(reset password|password|login|access)\b", body, re.I):
+        step1 = "Verify your account via the secure link we’ll send to your email"
+        step2 = "If you still can’t access, we’ll escalate to our identity team"
+    elif re.search(r"\b(billing|invoice|payment|charge|refund)\b", body, re.I):
+        step1 = "Review the last transaction and issue a corrective refund if needed"
+        step2 = "Share an updated invoice once corrected"
+    elif re.search(r"\b(api|integration|token|webhook)\b", body, re.I):
+        step1 = "Validate your API credentials and required scopes"
+        step2 = "Provide a working sample request from your environment"
+    else:
+        step1 = "Collect exact error messages and recent changes"
+        step2 = "Reproduce the issue and propose a fix or workaround"
+
+    return RESP_TEMPLATE.format(name=name, ack=ack, kb_line=kb_line, step1=step1, step2=step2)
+
+filtered['draft_reply'] = filtered.apply(lambda r: draft_response(r, KB), axis=1)
+
+# --- Dashboard ---
+col1, col2 = st.columns([1,1])
+with col1:
+    st.subheader("📊 Analytics")
+    st.metric("Total emails (filtered)", len(filtered))
+    st.metric("Urgent", int(filtered['is_urgent'].sum()))
+    st.metric("Not urgent", int((~filtered['is_urgent']).sum()))
+    st.metric("Negative sentiment", int((filtered['sentiment']=='Negative').sum()))
+with col2:
+    st.subheader("Distribution")
+    st.bar_chart(filtered['sentiment'].value_counts())
+    st.bar_chart(filtered['priority'].value_counts())
+
+st.markdown("---")
+
+st.subheader("🗂️ Queue (urgent first)")
+queue_rows = []
+while pq:
+    _, _, idx = heapq.heappop(pq)
+    queue_rows.append(filtered.loc[idx])
+queue_df = pd.DataFrame(queue_rows)
+
+st.dataframe(queue_df[['sender','subject','sent_date','priority','sentiment','alt_emails','phones','requirements']], use_container_width=True)
+
+st.markdown("---")
+
+st.subheader("✍️ AI Draft Replies")
+for i, row in queue_df.iterrows():
+    with st.expander(f"Reply to: {row['sender']} — {row['subject']}"):
+        st.code(row['draft_reply'])
+        st.caption("Review and edit before sending via your email client/API.")
+
+# Export enriched CSV
+csv = filtered.to_csv(index=False).encode('utf-8')
+st.download_button("⬇️ Download enriched CSV", csv, file_name="enriched_support_emails.csv", mime="text/csv")
+
+st.info("This demo uses rule-based sentiment/urgency and a TF-IDF powered KB search (RAG-lite). Integrate OpenAI/HF for production-grade responses.")
